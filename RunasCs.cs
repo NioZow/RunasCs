@@ -533,16 +533,21 @@ public class RunasCs
         socket = socketLocal;
     }
 
-    private void RunasRemoteImpersonation(string username, string domainName, string password, int logonType, int logonProvider, string commandLine, ref STARTUPINFO startupInfo, ref ProcessInformation processInfo, ref int logonTypeNotFiltered) {
-        IntPtr hToken = IntPtr.Zero;
+    private void RunasRemoteImpersonation(string username, string domainName, string password, int logonType, int logonProvider, string commandLine, ref STARTUPINFO startupInfo, ref ProcessInformation processInfo, ref int logonTypeNotFiltered, IntPtr hToken) {
         IntPtr hTokenDupImpersonation = IntPtr.Zero;
         IntPtr lpEnvironment = IntPtr.Zero;
-        if (!LogonUser(username, domainName, password, logonType, logonProvider, ref hToken))
-            throw new RunasCsException("LogonUser", true);
-        if (IsLimitedUserLogon(hToken, username, domainName, password, out logonTypeNotFiltered))
-            Console.Out.WriteLine(String.Format("[*] Warning: Logon for user '{0}' is limited. Use the --logon-type value '{1}' to obtain a more privileged token", username, logonTypeNotFiltered));
+
+        if (hToken == IntPtr.Zero)
+        {
+            if (!LogonUser(username, domainName, password, logonType, logonProvider, ref hToken))
+                throw new RunasCsException("LogonUser", true);
+            if (IsLimitedUserLogon(hToken, username, domainName, password, out logonTypeNotFiltered))
+                Console.Out.WriteLine(String.Format("[*] Warning: Logon for user '{0}' is limited. Use the --logon-type value '{1}' to obtain a more privileged token", username, logonTypeNotFiltered));
+        }
+        
         if (!DuplicateTokenEx(hToken, AccessToken.TOKEN_ALL_ACCESS, IntPtr.Zero, SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation, TokenImpersonation, ref hTokenDupImpersonation))
             throw new RunasCsException("DuplicateTokenEx", true);
+        
         if (AccessToken.GetTokenIntegrityLevel(WindowsIdentity.GetCurrent().Token) < AccessToken.GetTokenIntegrityLevel(hTokenDupImpersonation))
             AccessToken.SetTokenIntegrityLevel(hTokenDupImpersonation, AccessToken.GetTokenIntegrityLevel(WindowsIdentity.GetCurrent().Token));
         // enable all privileges assigned to the token
@@ -634,16 +639,30 @@ public class RunasCs
         CloseHandle(hTokenDuplicate);
     }
 
-    private void RunasCreateProcessAsUserW(string username, string domainName, string password, int logonType, int logonProvider, string commandLine, bool forceUserProfileCreation, bool userProfileExists, ref STARTUPINFO startupInfo, ref ProcessInformation processInfo, ref int logonTypeNotFiltered) {
-        IntPtr hToken = IntPtr.Zero;
+    private void RunasCreateProcessAsUserW(string username, string domainName, string password, int logonType, int logonProvider, string commandLine, bool forceUserProfileCreation, bool userProfileExists, ref STARTUPINFO startupInfo, ref ProcessInformation processInfo, ref int logonTypeNotFiltered, IntPtr hToken) {
         IntPtr hTokenDuplicate = IntPtr.Zero;
         IntPtr lpEnvironment = IntPtr.Zero;
-        if (!LogonUser(username, domainName, password, logonType, logonProvider, ref hToken))
-            throw new RunasCsException("LogonUser", true);
+        bool checkLimitedLogon = true;
+
+        if (hToken == IntPtr.Zero)
+        {
+            if (!LogonUser(username, domainName, password, logonType, logonProvider, ref hToken))
+                throw new RunasCsException("LogonUser", true);
+        }
+        else
+        {
+            checkLimitedLogon = false;
+        }
+        
         if (!DuplicateTokenEx(hToken, AccessToken.TOKEN_ALL_ACCESS, IntPtr.Zero, SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation, TokenPrimary, ref hTokenDuplicate))
             throw new RunasCsException("DuplicateTokenEx", true);
-        if (IsLimitedUserLogon(hTokenDuplicate, username, domainName, password, out logonTypeNotFiltered))
-            Console.Out.WriteLine(String.Format("[*] Warning: Logon for user '{0}' is limited. Use the --logon-type value '{1}' to obtain a more privileged token", username, logonTypeNotFiltered));
+        
+        if (checkLimitedLogon)
+        {
+            if (IsLimitedUserLogon(hTokenDuplicate, username, domainName, password, out logonTypeNotFiltered))
+                Console.Out.WriteLine(String.Format("[*] Warning: Logon for user '{0}' is limited. Use the --logon-type value '{1}' to obtain a more privileged token", username, logonTypeNotFiltered));
+        }
+        
         GetUserEnvironmentBlock(hTokenDuplicate, username, forceUserProfileCreation, userProfileExists, out lpEnvironment);
         // Enable SeAssignPrimaryTokenPrivilege on our current process needed by the kernel to make the CreateProcessAsUserW call
         AccessToken.EnablePrivilege("SeAssignPrimaryTokenPrivilege", WindowsIdentity.GetCurrent().Token);
@@ -710,6 +729,8 @@ public class RunasCs
         string commandLine = ParseCommonProcessesInCommandline(cmd);
         int logonProvider = LOGON32_PROVIDER_DEFAULT;
         int logonTypeNotFiltered = 0;
+        bool userProfileExists;
+        uint logonFlags = 0;
         STARTUPINFO startupInfo = new STARTUPINFO();
         startupInfo.cb = Marshal.SizeOf(startupInfo);
         startupInfo.lpReserved = null;
@@ -727,17 +748,19 @@ public class RunasCs
                 domainName = ".";
         }
 
-        if (passTheHash) {
+        if (passTheHash)
+        {
             // perform pass the hash
 
             // set the default as workgroup
             // so this will work for any local user
-            if (domainName == "") {
+            if (domainName == "")
+            {
                 domainName = "WORKGROUP";
             }
-            
+
             byte[] ntHash;
-            
+
             // convert the password hash to a byte array
             try
             {
@@ -748,10 +771,10 @@ public class RunasCs
                 Console.WriteLine("[-] " + e.Message);
                 return "";
             }
-            
+
             object oldFilterPolicy = null;
             IntPtr hToken = IntPtr.Zero;
-            
+
             RunasNtlmPth ntlmAuth = new RunasNtlmPth();
 
             // disable token filtering in order to run an elevated process
@@ -759,8 +782,8 @@ public class RunasCs
             {
                 oldFilterPolicy = ntlmAuth.DisableTokenFiltering();
             }
-            
-            // get the token and run the process
+
+            // get the token
             try
             {
                 hToken = ntlmAuth.RunasNtlm(username, domainName, ntHash);
@@ -770,24 +793,32 @@ public class RunasCs
                 Console.WriteLine(e.Message);
                 return "";
             }
-            
-            RunasCreateProcessWithTokenW(username, domainName, password, commandLine, logonType, 0, logonProvider, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, hToken);
 
-            // restore token filtering
-            if (disableTokenFiltering)
+            if (remoteImpersonation)
+                RunasRemoteImpersonation(username, domainName, password, logonType, logonProvider, commandLine, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, hToken);
+            else if (createProcessFunction == 2)
+                throw new RunasCsException("The flag --function 2 is not compatible with --pth");
+            else if (bypassUac)
+                throw new RunasCsException(String.Format("The flag --bypass-uac is not compatible with {0} but only with --function '2' (CreateProcessWithLogonW)", GetProcessFunction(createProcessFunction)));
+            else if (createProcessFunction == 0)
+                RunasCreateProcessAsUserW(username, domainName, password, logonType, logonProvider, commandLine, forceUserProfileCreation, false, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, hToken);
+            else if (createProcessFunction == 1)
+                RunasCreateProcessWithTokenW(username, domainName, password, commandLine, logonType, logonFlags, logonProvider, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, hToken);
+            
+            if (passTheHash && disableTokenFiltering)
             {
+                // restore token filtering former policy
                 ntlmAuth.RestoreTokenFiltering(oldFilterPolicy);
             }
+            
         } else {
             // we check if the user has been granted the logon type requested, if not we show a message suggesting which logon type can be used to succesfully logon
             CheckAvailableUserLogonType(username, password, domainName, logonType, logonProvider);
             
             // Use the proper CreateProcess* function
             if (remoteImpersonation)
-                RunasRemoteImpersonation(username, domainName, password, logonType, logonProvider, commandLine, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
+                RunasRemoteImpersonation(username, domainName, password, logonType, logonProvider, commandLine, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, IntPtr.Zero);
             else {
-                bool userProfileExists;
-                uint logonFlags = 0;
                 userProfileExists = IsUserProfileCreated(username, password, domainName, logonType);
                 // we load the user profile only if it has been already created or the creation is forced from the flag --force-profile
                 if (userProfileExists || forceUserProfileCreation)
@@ -800,7 +831,7 @@ public class RunasCs
                     if (bypassUac)
                         throw new RunasCsException(String.Format("The flag --bypass-uac is not compatible with {0} but only with --function '2' (CreateProcessWithLogonW)", GetProcessFunction(createProcessFunction)));
                     if (createProcessFunction == 0)
-                        RunasCreateProcessAsUserW(username, domainName, password, logonType, logonProvider, commandLine, forceUserProfileCreation, userProfileExists, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
+                        RunasCreateProcessAsUserW(username, domainName, password, logonType, logonProvider, commandLine, forceUserProfileCreation, userProfileExists, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, IntPtr.Zero);
                     else if (createProcessFunction == 1)
                         RunasCreateProcessWithTokenW(username, domainName, password, commandLine, logonType, logonFlags, logonProvider, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, IntPtr.Zero);
                 }
@@ -2462,7 +2493,7 @@ Examples:
         return createProcessFunction;
     }
 
-    private static int DefaultCreateProcessFunction()
+    private static int DefaultCreateProcessFunction(bool pth, bool remoteImpersonation)
     {
         int createProcessFunction = 2;
         IntPtr currentTokenHandle = WindowsIdentity.GetCurrent().Token;        
@@ -2480,9 +2511,13 @@ Examples:
         }
         if (SeAssignPrimaryTokenPrivilegeAssigned)
             createProcessFunction = 0;
-        else 
-            if (SeImpersonatePrivilegeAssigned)
-                createProcessFunction = 1;
+        else if (SeImpersonatePrivilegeAssigned)
+            createProcessFunction = 1;
+        else if (!pth)
+            createProcessFunction = 2;
+        else if (!remoteImpersonation)
+            throw new RunasCsException("it will be impossible to create a process using a primary token that impersonates the user, try with --remote-impersonation");
+        
         return createProcessFunction;
     }
 
@@ -2493,13 +2528,13 @@ Examples:
             Console.Out.Write(help);
             return "";
         }
-        string output = "";
+        string output = "", function = "";
         List<string> positionals = new List<string>();
         string username, password, cmd, domain;
         username = password = cmd = domain = string.Empty;
         string[] remote = null;
         uint processTimeout = 120000;
-        int logonType = 2, createProcessFunction = DefaultCreateProcessFunction();
+        int logonType = 2;
         bool forceUserProfileCreation = false, bypassUac = false, remoteImpersonation = false, passTheHash = false, disableTokenFiltering = false;
         
         try {
@@ -2524,7 +2559,7 @@ Examples:
 
                     case "-f":
                     case "--function":
-                        createProcessFunction = ValidateCreateProcessFunction(args[++ctr]);
+                        function = args[++ctr];
                         break;
 
                     case "-r":
@@ -2568,6 +2603,24 @@ Examples:
 
         if( positionals.Count < 3 ) {
             return "[-] Not enough arguments. 3 Arguments required. Use --help for additional help.";
+        }
+
+        int createProcessFunction = 2;
+        if (function != "")
+        {
+            createProcessFunction = ValidateCreateProcessFunction(function);
+        }
+        else
+        {
+            try
+            {
+                createProcessFunction = DefaultCreateProcessFunction(passTheHash, remoteImpersonation);
+            }
+            catch (RunasCsException e)
+            {
+                Console.Out.Write(e.Message);
+                return "";
+            }
         }
 
         username = positionals[0];
